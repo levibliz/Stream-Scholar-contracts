@@ -9,11 +9,30 @@ cargo-fuzz = true
 
 [dependencies]
 arbitrary = { version = "1", features = ["derive"] }
+claim_math = { path = "../crates/claim_math" }
 expiry_math = { path = "../crates/expiry_math" }
 libfuzzer-sys = "0.4"
 
 [[bin]]
 name = "expiry_time_extremes"
 path = "fuzz_targets/expiry_time_extremes.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "partial_claim_invariants"
+path = "fuzz_targets/partial_claim_invariants.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rounding_invariants"
+path = "fuzz_targets/rounding_invariants.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "qf_matching_invariants"
+path = "fuzz_targets/qf_matching_invariants.rs"
 test = false
 doc = false

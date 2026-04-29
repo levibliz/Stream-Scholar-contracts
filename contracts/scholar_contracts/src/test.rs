@@ -2,7 +2,7 @@
 
 use super::*;
 use soroban_sdk::testutils::{Address as _, Ledger};
-use soroban_sdk::{token, vec, Address, Env, IntoVal, Symbol, Vec};
+use soroban_sdk::{token, vec, Address, Env, IntoVal, Symbol, Vec, Val};
 
 #[test]
 fn test_scholarship_flow() {
@@ -27,6 +27,18 @@ fn test_scholarship_flow() {
 
     // Student buys access to course 1 for 100 tokens (should be 10 seconds at base rate)
     client.buy_access(&student, &1, &100, &token_address.address());
+
+    // Verify buy_access event
+    let events = env.events().all();
+    let last_event = events.last().unwrap();
+    assert_eq!(
+        last_event,
+        (
+            contract_id.clone(),
+            (Symbol::new(&env, "buy_access"), student.clone(), 1u64).into_val(&env),
+            (100i128, 10u64).into_val(&env)
+        )
+    );
 
     // Verify token balance
     assert_eq!(
@@ -178,6 +190,160 @@ fn test_sbt_minting_trigger() {
 
     // Should be minted now
     assert!(client.is_sbt_minted(&student, &1));
+}
+
+#[test]
+fn test_claim_gas_subsidy_events() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    
+    // Deploy the scholarship contract
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.set_gas_treasury(&admin, &token_address.address());
+
+    // Mint tokens to contract for gas treasury (SUBSIDY_AMOUNT = 5 XLM/tokens)
+    token_client.mint(&contract_id, &1000);
+
+    // Claim gas subsidy
+    client.claim_gas_subsidy(&student);
+
+    // Verify gas_subsidy event
+    let events = env.events().all();
+    let last_event = events.last().unwrap();
+    assert_eq!(
+        last_event,
+        (
+            contract_id.clone(),
+            (Symbol::new(&env, "gas_subsidy"), student.clone()).into_val(&env),
+            5i128.into_val(&env)
+        )
+    );
+}
+
+#[test]
+fn test_milestone_review_and_bounty_events() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let teacher = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&funder, &2000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // 1. Setup committee
+    let committee = MilestoneReviewCommittee {
+        committee_id: 1,
+        approval_threshold: 1,
+    };
+    client.configure_milestone_committee(&admin, &student, &1, &committee);
+    client.register_committee_member(&admin, &1, &teacher);
+    client.mark_committee_sep12_verified(&admin, &teacher, &true);
+
+    // 2. Fund bounty reserve
+    client.fund_bounty_reserve(&funder, &student, &1, &500, &token_address.address());
+
+    // 3. Grant access (needed for claim_milestone_bounty)
+    client.buy_access(&student, &1, &100, &token_address.address());
+
+    // 4. Committee sign milestone
+    client.committee_sign_milestone(&teacher, &student, &1, &1);
+
+    // Verify CommitteeReviewStarted and Finalized events
+    let events = env.events().all();
+    // last event should be CommitteeReviewFinalized
+    let last_event = events.last().unwrap();
+    assert_eq!(
+        last_event,
+        (
+            contract_id.clone(),
+            (Symbol::new(&env, "CommitteeReviewFinalized"), student.clone(), 1u64).into_val(&env),
+            1u64.into_val(&env)
+        )
+    );
+
+    // 5. Claim milestone bounty
+    client.claim_milestone_bounty(&student, &1, &1, &200, &soroban_sdk::Bytes::from_slice(&env, b"test_advisor_sig"));
+
+    // Verify BountyClaimed event
+    let events = env.events().all();
+    let last_event = events.last().unwrap();
+    assert_eq!(
+        last_event,
+        (
+            contract_id.clone(),
+            (Symbol::new(&env, "BountyClaimed"), student.clone(), 1u64).into_val(&env),
+            200i128.into_val(&env)
+        )
+    );
+}
+
+#[test]
+fn test_governance_veto_events() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let council = Address::generate(&env);
+    let proposer = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&proposer, &1000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.set_security_council(&admin, &council);
+
+    // 1. Propose referendum
+    let ref_id = client.propose_referendum(
+        &proposer,
+        &contract_id,
+        &Symbol::new(&env, "set_tax_rate"),
+        &(admin.clone(), 500u32).into_val(&env),
+        &500,
+        &token_address.address(),
+    );
+
+    // 2. Veto referendum
+    client.veto_action(&council, &ref_id);
+
+    // Verify GovernanceVetoExecuted event
+    let events = env.events().all();
+    let last_event = events.last().unwrap();
+    assert_eq!(
+        last_event,
+        (
+            contract_id.clone(),
+            (Symbol::new(&env, "GovernanceVetoExecuted"), ref_id).into_val(&env),
+            Symbol::new(&env, "set_tax_rate").into_val(&env)
+        )
+    );
 }
 
 #[test]
@@ -634,7 +800,7 @@ fn test_calculate_remaining_airtime() {
     };
     client.verify_enrollment(&student, &oracle, &soroban_sdk::BytesN::from_array(&env, &[0u8; 64]), &enrollment);
 
-    client.fund_scholarship(&funder, &student, &500, &token_address.address());
+    client.fund_scholarship(&funder, &student, &500, &token_address.address(), &false);
 
     // 500 balance / 10 base_rate = 50 seconds
     assert_eq!(client.calculate_remaining_airtime(&student), 50);
@@ -696,7 +862,7 @@ fn test_withdrawal_whitelisting() {
     };
     client.verify_enrollment(&student, &oracle, &soroban_sdk::BytesN::from_array(&env, &[0u8; 64]), &enrollment);
 
-    client.fund_scholarship(&funder, &student, &500, &token_address.address());
+    client.fund_scholarship(&funder, &student, &500, &token_address.address(), &false);
 
     // Set whitelisted address
     env.ledger().set_timestamp(0);
@@ -714,6 +880,95 @@ fn test_withdrawal_whitelisting() {
     client.claim_scholarship(&student, &200);
 
     assert_eq!(token::Client::new(&env, &token_address.address()).balance(&payout), 200);
+}
+
+#[test]
+fn test_claim_scholarship_gas_bounds_enforced() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let student = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&funder, &1000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    client.fund_scholarship(&funder, &student, &500, &token_address.address());
+
+    // Set a very low gas bound so the claim should fail
+    client.set_claim_gas_bounds(&admin, &100000, &1);
+
+    let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "claim_scholarship"),
+        (student.clone(), 200i128).into_val(&env),
+    );
+    assert!(result.is_err(), "Claim should be rejected when gas bounds are too low");
+
+    // Increase the gas bound so the claim can succeed
+    client.set_claim_gas_bounds(&admin, &1_000_000, &2);
+    client.claim_scholarship(&student, &200);
+
+    assert_eq!(token::Client::new(&env, &token_address.address()).balance(&student), 200);
+}
+
+#[test]
+fn test_private_claim_cross_contract_call_bounds_enforced() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&student, &1000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    client.buy_access(&student, &1, &500, &token_address.address());
+
+    let commitment = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+    client.store_claim_commitment(&admin, &commitment);
+
+    client.set_claim_gas_bounds(&admin, &2_000_000, &2);
+
+    let nullifier = soroban_sdk::BytesN::from_array(&env, &[2u8; 32]);
+    let proof_data = soroban_sdk::Bytes::from_slice(&env, &[0u8; 128]);
+    let mut public_signals = Vec::new(&env);
+    public_signals.push_back(soroban_sdk::BytesN::from_array(&env, &[3u8; 32]));
+
+    let zk_proof = ZKClaimProof {
+        nullifier: nullifier.clone(),
+        commitment: commitment.clone(),
+        proof: proof_data,
+        public_signals,
+    };
+
+    let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "claim_scholarship_private"),
+        (&student, 100i128, &zk_proof),
+    );
+
+    assert!(
+        result.is_err(),
+        "Private scholarship claim should be rejected when cross-contract call bounds are exceeded"
+    );
 }
 
 #[test]
@@ -2303,6 +2558,245 @@ fn test_private_claim_logic() {
     assert!(result_invalid.is_err());
 }
 
+#[test]
+fn test_sac_reconcile_applies_protocol_haircut() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let student_a = Address::generate(&env);
+    let student_b = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_addr = env.register_stellar_asset_contract_v2(token_admin);
+    let token_sa = token::StellarAssetClient::new(&env, &token_addr.address());
+    token_sa.mint(&funder, &10_000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.initialize(&admin, &10, &60);
+    client.fund_scholarship(&funder, &student_a, &1_000, &token_addr.address(), &false);
+    client.fund_scholarship(&funder, &student_b, &1_000, &token_addr.address(), &false);
+
+    token_sa.clawback(&contract_id, &500);
+
+    let event_hash: soroban_sdk::BytesN<32> = env
+        .crypto()
+        .sha256(&soroban_sdk::Bytes::from_slice(&env, b"issuer-clawback-1"))
+        .into();
+
+    let shortfall = client.reconcile_balances(
+        &admin,
+        &token_addr.address(),
+        &event_hash,
+        &500,
+        &None,
+        &true,
+    );
+    assert_eq!(shortfall, 500);
+
+    let scholarship_a = client.get_scholarship(&student_a);
+    let scholarship_b = client.get_scholarship(&student_b);
+    assert_eq!(scholarship_a.balance, 750);
+    assert_eq!(scholarship_a.unlocked_balance, 750);
+    assert_eq!(scholarship_b.balance, 750);
+    assert_eq!(scholarship_b.unlocked_balance, 750);
+}
+
+#[test]
+fn test_sac_reconcile_targeted_student_termination() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let student_a = Address::generate(&env);
+    let student_b = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_addr = env.register_stellar_asset_contract_v2(token_admin);
+    let token_sa = token::StellarAssetClient::new(&env, &token_addr.address());
+    token_sa.mint(&funder, &10_000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.initialize(&admin, &10, &60);
+    client.fund_scholarship(&funder, &student_a, &1_200, &token_addr.address(), &false);
+    client.fund_scholarship(&funder, &student_b, &800, &token_addr.address(), &false);
+
+    token_sa.clawback(&contract_id, &300);
+
+    let event_hash: soroban_sdk::BytesN<32> = env
+        .crypto()
+        .sha256(&soroban_sdk::Bytes::from_slice(&env, b"issuer-clawback-2"))
+        .into();
+
+    let shortfall = client.reconcile_balances(
+        &admin,
+        &token_addr.address(),
+        &event_hash,
+        &300,
+        &Some(student_a.clone()),
+        &false,
+    );
+    assert_eq!(shortfall, 0);
+
+    let scholarship_a = client.get_scholarship(&student_a);
+    let scholarship_b = client.get_scholarship(&student_b);
+    assert_eq!(scholarship_a.balance, 0);
+    assert_eq!(scholarship_a.unlocked_balance, 0);
+    assert!(scholarship_a.is_paused);
+    assert!(scholarship_a.is_disputed);
+    assert_eq!(scholarship_b.balance, 800);
+    assert_eq!(scholarship_b.unlocked_balance, 800);
+}
+
+#[test]
+fn test_sac_reconcile_rejects_mismatched_evidence() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_addr = env.register_stellar_asset_contract_v2(token_admin);
+    let token_sa = token::StellarAssetClient::new(&env, &token_addr.address());
+    token_sa.mint(&funder, &5_000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.initialize(&admin, &10, &60);
+    client.fund_scholarship(&funder, &student, &1_000, &token_addr.address(), &false);
+
+    let event_hash: soroban_sdk::BytesN<32> = env
+        .crypto()
+        .sha256(&soroban_sdk::Bytes::from_slice(&env, b"forged-clawback"))
+        .into();
+
+    let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "reconcile_balances"),
+        Vec::from_array(
+            &env,
+            [
+                admin.into_val(&env),
+                token_addr.address().into_val(&env),
+                event_hash.into_val(&env),
+                500_i128.into_val(&env),
+                Option::<Address>::None.into_val(&env),
+                false.into_val(&env),
+            ],
+        ),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_refinance_grant_mid_semester() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let old_sponsor = Address::generate(&env);
+    let new_sponsor = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&old_sponsor, &1_000);
+    token_client.mint(&new_sponsor, &2_000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.set_kyc_status(&admin, &new_sponsor, &true);
+
+    client.fund_scholarship(&old_sponsor, &student, &500, &token_address.address(), &false);
+    client.create_stream(
+        &old_sponsor,
+        &student,
+        &1_i128,
+        &token_address.address(),
+        &Option::<Symbol>::None,
+    );
+
+    let sponsor_old_balance_before = token_client.balance(&old_sponsor);
+    let sponsor_new_balance_before = token_client.balance(&new_sponsor);
+
+    let refined_amount = client.refinance_grant(
+        &student,
+        &old_sponsor,
+        &new_sponsor,
+        &token_address.address(),
+        &soroban_sdk::BytesN::from_array(&env, &[1u8; 64]),
+        &soroban_sdk::Bytes::from_slice(&env, b"refinance consent"),
+    );
+
+    assert_eq!(refined_amount, 500);
+    assert_eq!(client.get_scholarship(&student).funder, new_sponsor);
+    assert_eq!(client.get_sponsor_mapping(&student), new_sponsor);
+    assert_eq!(token_client.balance(&old_sponsor), sponsor_old_balance_before + 500);
+    assert_eq!(token_client.balance(&new_sponsor), sponsor_new_balance_before - 505);
+    assert_eq!(client.get_protocol_fees_accrued(&token_address.address()), 5);
+
+    env.ledger().set_timestamp(20);
+    let withdrawn = client.withdraw_from_stream(&student, &new_sponsor, &token_address.address());
+    assert_eq!(withdrawn, 20);
+    assert_eq!(client.get_scholarship(&student).funder, new_sponsor);
+}
+
+#[test]
+fn test_refinance_grant_fails_when_kyc_not_verified() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let old_sponsor = Address::generate(&env);
+    let new_sponsor = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&old_sponsor, &1_000);
+    token_client.mint(&new_sponsor, &1_000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    client.fund_scholarship(&old_sponsor, &student, &500, &token_address.address(), &false);
+
+    let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "refinance_grant"),
+        Vec::from_array(
+            &env,
+            [
+                student.clone().into_val(&env),
+                old_sponsor.clone().into_val(&env),
+                new_sponsor.clone().into_val(&env),
+                token_address.address().into_val(&env),
+                soroban_sdk::BytesN::from_array(&env, &[1u8; 64]).into_val(&env),
+                soroban_sdk::Bytes::from_slice(&env, b"refinance consent").into_val(&env),
+            ],
+        ),
+    );
+
+    assert!(result.is_err());
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Issue #209 — Final E2E Integration Test (Oracle to Yield)
 //
@@ -2320,6 +2814,17 @@ fn test_private_claim_logic() {
 //   ✓ State changes across the complex student lifecycle are mathematically verified.
 //   ✓ Protocol is validated as "Mainnet Ready".
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Mock oracle contract for academic progress verification
+#[contract]
+pub struct MockOracle;
+
+#[contractimpl]
+impl MockOracle {
+    pub fn check_status(_env: Env, _student: Address, course_id: u64) -> u32 {
+        if course_id == 1 { 1 } else if course_id == 2 { 0 } else { 2 }
+    }
+}
 
 #[test]
 fn test_e2e_oracle_to_yield_full_lifecycle() {
@@ -2366,7 +2871,7 @@ fn test_e2e_oracle_to_yield_full_lifecycle() {
     //   university gets 7,000 (transferred immediately)
     //   student scholarship balance = 3,000
     let donor_balance_before = token.balance(&donor);
-    client.fund_scholarship(&donor, &student, &10_000, &token_addr.address());
+    client.fund_scholarship(&donor, &student, &10_000, &token_addr.address(), &false);
 
     assert_eq!(token.balance(&donor), donor_balance_before - 10_000,
         "Donor should have paid 10,000 tokens");
@@ -2509,4 +3014,566 @@ fn test_e2e_oracle_to_yield_full_lifecycle() {
     // ── Protocol is "Mainnet Ready" ───────────────────────────────────────────
     // All assertions passed: the protocol handles the full lifecycle without
     // panics, logic collisions, or token leakage.
+}
+
+#[test]
+fn test_rogue_dao_vetoed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let admin = Address::generate(&env);
+    let council = Address::generate(&env);
+    let rogue_proposer = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&rogue_proposer, &1000);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.set_security_council(&admin, &council);
+    
+    let args = Vec::from_array(&env, [rogue_proposer.into_val(&env), 500u32.into_val(&env)]);
+    let ref_id = client.create_referendum(&rogue_proposer, &contract_id, &Symbol::new(&env, "set_tax_rate"), &args, &token_address.address(), &500);
+    
+    // Rogue DAO votes yes
+    client.vote_referendum(&rogue_proposer, &ref_id, &true, &1000);
+    
+    // Fast forward to end of voting period
+    env.ledger().set_timestamp(604801); 
+    
+    // Queue the referendum for execution delay (72 hours)
+    client.queue_referendum(&rogue_proposer, &ref_id);
+    
+    // Security council notices malicious transaction and calls veto
+    client.veto_action(&council, &ref_id);
+    
+    // Fast forward past execution delay
+    env.ledger().set_timestamp(604801 + 259200 + 10);
+    
+    // Execute should fail because it was vetoed
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "execute_referendum"),
+        (&rogue_proposer, ref_id).into_val(&env)
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+#[should_panic(expected = "Execution delay not met")]
+fn test_referendum_execution_delay() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let admin = Address::generate(&env);
+    let proposer = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&proposer, &1000);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    
+    let args = Vec::from_array(&env, [proposer.into_val(&env), 500u32.into_val(&env)]);
+    let ref_id = client.create_referendum(&proposer, &contract_id, &Symbol::new(&env, "set_tax_rate"), &args, &token_address.address(), &500);
+    
+    client.vote_referendum(&proposer, &ref_id, &true, &1000);
+    
+    env.ledger().set_timestamp(604801); 
+    client.queue_referendum(&proposer, &ref_id);
+    
+    // Try to execute immediately, should panic
+    client.execute_referendum(&proposer, &ref_id);
+}
+
+#[test]
+fn test_council_rotation_and_dissolve() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let admin = Address::generate(&env);
+    let new_council = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    
+    // Using current_contract_address directly for testing to mock DAO
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "queue_council_rotation"),
+        (&new_council,).into_val(&env)
+    );
+    // Should succeed queuing
+    assert!(result.is_ok());
+    
+    // Try to execute before timelock expires
+    let result_fail = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "execute_council_rotation"),
+        ().into_val(&env)
+    );
+    assert!(result_fail.is_err());
+    
+    // Fast forward 7 days
+    env.ledger().set_timestamp(604801);
+    
+    // Execute rotation
+    let result_success = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "execute_council_rotation"),
+        ().into_val(&env)
+    );
+    assert!(result_success.is_ok());
+    
+    // Now emergency dissolve
+    let result_dissolve = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "emergency_dissolve_council"),
+        ().into_val(&env)
+    );
+    assert!(result_dissolve.is_ok());
+}
+
+// --- Multi-Language Course Metadata Tests (Issue #46) ---
+
+#[test]
+fn test_register_course_with_metadata() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    
+    let initial_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "QmTest123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
+
+    // Register course
+    client.register_course(&admin, &course_id, &creator, &default_language, &initial_metadata);
+
+    // Verify course info
+    let course_info = client.get_course_info(&course_id).unwrap();
+    assert_eq!(course_info.course_id, course_id);
+    assert_eq!(course_info.creator, creator);
+    assert_eq!(course_info.default_language, default_language);
+    assert_eq!(course_info.available_languages.len(), 1);
+    assert!(course_info.available_languages.contains(&default_language));
+    assert!(course_info.is_active);
+
+    // Verify metadata
+    let metadata = client.get_course_metadata(&course_id, &default_language).unwrap();
+    assert_eq!(metadata.language_code, default_language);
+    assert_eq!(metadata.title, Symbol::new(&env, "Introduction to Blockchain"));
+    assert_eq!(metadata.description, Symbol::new(&env, "Learn the fundamentals of blockchain technology"));
+
+    // Verify course registry
+    let registry = client.get_course_registry().unwrap();
+    assert_eq!(registry.courses.len(), 1);
+    assert!(registry.courses.contains(&course_id));
+}
+
+#[test]
+fn test_add_multiple_languages() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    
+    let initial_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "QmTest123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
+
+    // Register course
+    client.register_course(&admin, &course_id, &creator, &default_language, &initial_metadata);
+
+    // Add Spanish version
+    let spanish_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "es"),
+        ipfs_link: Symbol::new(&env, "QmSpanish123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introducción a Blockchain"),
+        description: Symbol::new(&env, "Aprende los fundamentos de la tecnología blockchain"),
+        updated_at: 0,
+    };
+
+    client.update_course_metadata(&admin, &course_id, &spanish_metadata);
+
+    // Add French version
+    let french_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "fr"),
+        ipfs_link: Symbol::new(&env, "QmFrench123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction à la Blockchain"),
+        description: Symbol::new(&env, "Apprenez les fondamentaux de la technologie blockchain"),
+        updated_at: 0,
+    };
+
+    client.update_course_metadata(&admin, &course_id, &french_metadata);
+
+    // Verify all languages are available
+    let languages = client.get_course_languages(&course_id);
+    assert_eq!(languages.len(), 3);
+    assert!(languages.contains(&Symbol::new(&env, "en")));
+    assert!(languages.contains(&Symbol::new(&env, "es")));
+    assert!(languages.contains(&Symbol::new(&env, "fr")));
+
+    // Verify each language metadata
+    let en_metadata = client.get_course_metadata(&course_id, &Symbol::new(&env, "en")).unwrap();
+    assert_eq!(en_metadata.title, Symbol::new(&env, "Introduction to Blockchain"));
+
+    let es_metadata = client.get_course_metadata(&course_id, &Symbol::new(&env, "es")).unwrap();
+    assert_eq!(es_metadata.title, Symbol::new(&env, "Introducción a Blockchain"));
+
+    let fr_metadata = client.get_course_metadata(&course_id, &Symbol::new(&env, "fr")).unwrap();
+    assert_eq!(fr_metadata.title, Symbol::new(&env, "Introduction à la Blockchain"));
+}
+
+#[test]
+fn test_remove_language() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    
+    let initial_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "QmTest123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
+
+    // Register course
+    client.register_course(&admin, &course_id, &creator, &default_language, &initial_metadata);
+
+    // Add Spanish version
+    let spanish_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "es"),
+        ipfs_link: Symbol::new(&env, "QmSpanish123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introducción a Blockchain"),
+        description: Symbol::new(&env, "Aprende los fundamentos de la tecnología blockchain"),
+        updated_at: 0,
+    };
+
+    client.update_course_metadata(&admin, &course_id, &spanish_metadata);
+
+    // Verify both languages exist
+    let languages = client.get_course_languages(&course_id);
+    assert_eq!(languages.len(), 2);
+
+    // Remove Spanish language
+    client.remove_course_language(&admin, &course_id, &Symbol::new(&env, "es"));
+
+    // Verify only English remains
+    let languages = client.get_course_languages(&course_id);
+    assert_eq!(languages.len(), 1);
+    assert!(languages.contains(&Symbol::new(&env, "en")));
+    assert!(!languages.contains(&Symbol::new(&env, "es")));
+
+    // Verify Spanish metadata is removed
+    assert!(client.get_course_metadata(&course_id, &Symbol::new(&env, "es")).is_none());
+    assert!(client.get_course_metadata(&course_id, &Symbol::new(&env, "en")).is_some());
+}
+
+#[test]
+fn test_cannot_remove_default_language() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    
+    let initial_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "QmTest123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
+
+    // Register course
+    client.register_course(&admin, &course_id, &creator, &default_language, &initial_metadata);
+
+    // Try to remove default language - should fail
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "remove_course_language"),
+        (&admin, course_id, default_language).into_val(&env)
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_invalid_language_code() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    let course_id = 1u64;
+    let invalid_language = Symbol::new(&env, "INVALID"); // Too long and uppercase
+    
+    let initial_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "INVALID"),
+        ipfs_link: Symbol::new(&env, "QmTest123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
+
+    // Try to register with invalid language code - should fail
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "register_course"),
+        (&admin, course_id, creator, invalid_language, initial_metadata).into_val(&env)
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_invalid_ipfs_link() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    
+    let initial_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "invalid_link"), // Too short and invalid format
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
+
+    // Register course with valid initial metadata
+    let valid_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "QmTest123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
+
+    client.register_course(&admin, &course_id, &creator, &default_language, &valid_metadata);
+
+    // Try to update with invalid IPFS link - should fail
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "update_course_metadata"),
+        (&admin, course_id, initial_metadata).into_val(&env)
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_unauthorized_access() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let unauthorized_user = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    
+    let initial_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "QmTest123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
+
+    // Try to register course with unauthorized user - should fail
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "register_course"),
+        (&unauthorized_user, course_id, creator, default_language, initial_metadata).into_val(&env)
+    );
+    assert!(result.is_err());
+
+    // Register with admin first
+    client.register_course(&admin, &course_id, &creator, &default_language, &initial_metadata);
+
+    // Try to update with unauthorized user - should fail
+    let spanish_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "es"),
+        ipfs_link: Symbol::new(&env, "QmSpanish123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introducción a Blockchain"),
+        description: Symbol::new(&env, "Aprende los fundamentos de la tecnología blockchain"),
+        updated_at: 0,
+    };
+
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "update_course_metadata"),
+        (&unauthorized_user, course_id, spanish_metadata).into_val(&env)
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_duplicate_course_registration() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    let course_id = 1u64;
+    let default_language = Symbol::new(&env, "en");
+    
+    let initial_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "QmTest123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Introduction to Blockchain"),
+        description: Symbol::new(&env, "Learn the fundamentals of blockchain technology"),
+        updated_at: 0,
+    };
+
+    // Register course
+    client.register_course(&admin, &course_id, &creator, &default_language, &initial_metadata);
+
+    // Try to register same course again - should fail
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "register_course"),
+        (&admin, course_id, creator, default_language, initial_metadata).into_val(&env)
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_course_registry_size_limit() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    let default_language = Symbol::new(&env, "en");
+    
+    // Register courses up to the limit
+    for i in 1..=MAX_COURSE_REGISTRY_SIZE {
+        let course_id = i;
+        let initial_metadata = CourseMetadata {
+            language_code: Symbol::new(&env, "en"),
+            ipfs_link: Symbol::new(&env, &format!("QmTest{:046}", i)[..]),
+            title: Symbol::new(&env, &format!("Course {}", i)[..]),
+            description: Symbol::new(&env, &format!("Description for course {}", i)[..]),
+            updated_at: 0,
+        };
+
+        client.register_course(&admin, &course_id, &creator, &default_language, &initial_metadata);
+    }
+
+    // Try to register one more course - should fail
+    let overflow_course_id = MAX_COURSE_REGISTRY_SIZE + 1;
+    let overflow_metadata = CourseMetadata {
+        language_code: Symbol::new(&env, "en"),
+        ipfs_link: Symbol::new(&env, "QmOverflow123456789012345678901234567890123456789012345678901234567890"),
+        title: Symbol::new(&env, "Overflow Course"),
+        description: Symbol::new(&env, "This course should not be registered"),
+        updated_at: 0,
+    };
+
+    let result = env.try_invoke_contract::<()>(
+        &contract_id,
+        &Symbol::new(&env, "register_course"),
+        (&admin, overflow_course_id, creator, default_language, overflow_metadata).into_val(&env)
+    );
+    assert!(result.is_err());
 }

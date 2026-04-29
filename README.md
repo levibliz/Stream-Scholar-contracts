@@ -152,6 +152,13 @@ npm run dev
 - Optimized contract interactions
 - Cost-effective streaming
 
+### Security & Validation
+- **Comprehensive string validation** preventing empty/malicious inputs
+- **XSS and injection protection** for all metadata fields
+- **Input sanitization** with character filtering and length limits
+- **Structured error handling** with descriptive error codes (600-612)
+- **Security hold mechanisms** for institutional oversights
+
 ## Development
 
 ### Building Contracts
